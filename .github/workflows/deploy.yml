@@ -6,16 +6,14 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
-  pages: write
-  id-token: write
+  contents: write
 
 concurrency:
   group: pages
   cancel-in-progress: true
 
 jobs:
-  build:
+  deploy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,20 +26,8 @@ jobs:
           # playwright yalnızca yerel e2e için; CI'da tarayıcı indirme
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
       - run: npm run build
-      - uses: actions/configure-pages@v5
+      # gh-pages dalına yayınlar; dalın oluşması Pages'i otomatik etkinleştirir
+      - uses: peaceiris/actions-gh-pages@v4
         with:
-          # İlk çalıştırmada Pages'i (kaynak: GitHub Actions) otomatik etkinleştir
-          enablement: true
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: dist
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - id: deployment
-        uses: actions/deploy-pages@v4
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./dist
