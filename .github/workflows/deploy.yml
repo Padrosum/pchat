@@ -29,6 +29,9 @@ jobs:
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
       - run: npm run build
       - uses: actions/configure-pages@v5
+        with:
+          # İlk çalıştırmada Pages'i (kaynak: GitHub Actions) otomatik etkinleştir
+          enablement: true
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist
