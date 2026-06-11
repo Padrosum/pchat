@@ -24,7 +24,25 @@ class PeerManager {
     const store = useChatStore.getState()
     store.setStatus('connecting')
 
-    const peer = new Peer(PEER_PREFIX + myId, { debug: 1 })
+    // Katı NAT/CGNAT (örn. mobil operatörler) arkasında doğrudan bağlantı kurulamaz;
+    // STUN'a ek olarak ücretsiz TURN relay'i (Open Relay) yedek yol sağlar.
+    const peer = new Peer(PEER_PREFIX + myId, {
+      debug: 1,
+      config: {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          {
+            urls: [
+              'turn:openrelay.metered.ca:80',
+              'turn:openrelay.metered.ca:443',
+              'turn:openrelay.metered.ca:443?transport=tcp',
+            ],
+            username: 'openrelayproject',
+            credential: 'openrelayproject',
+          },
+        ],
+      },
+    })
     this.peer = peer
 
     peer.on('open', () => {
