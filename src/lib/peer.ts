@@ -1,5 +1,5 @@
 import Peer, { type DataConnection } from 'peerjs'
-import { db, ensureContact, pendingOf, type Message } from './db'
+import { db, ensureContact, undeliveredOf, type Message } from './db'
 import { PEER_PREFIX } from './id'
 import { useChatStore } from '../store/chat'
 
@@ -13,6 +13,7 @@ const RECONNECT_DELAY_MS = 2_000
 
 class PeerManager {
   private peer: Peer | null = null
+  private myId = ''
   private conns = new Map<string, DataConnection>()
   private attempts = new Map<string, number>()
   /** Peer henüz açılmadan istenen bağlantılar — 'open' gelince kurulur. */
@@ -21,6 +22,7 @@ class PeerManager {
 
   start(myId: string) {
     if (this.peer) return
+    this.myId = myId
     const store = useChatStore.getState()
     store.setStatus('connecting')
 
@@ -53,7 +55,7 @@ class PeerManager {
       void this.connectToContacts()
     })
 
-    peer.on('connection', (conn) => this.setupConnection(conn))
+    peer.on('connection', (conn) => this.setupConnection(conn, true))
 
     peer.on('disconnected', () => {
       useChatStore.getState().setStatus('connecting')
@@ -106,14 +108,27 @@ class PeerManager {
     this.conns.delete(friendId)
     this.attempts.set(friendId, Date.now())
     const conn = this.peer.connect(PEER_PREFIX + friendId, { reliable: true })
-    this.setupConnection(conn)
+    this.setupConnection(conn, false)
   }
 
-  private setupConnection(conn: DataConnection) {
+  private setupConnection(conn: DataConnection, incoming: boolean) {
     const friendId = conn.peer.startsWith(PEER_PREFIX)
       ? conn.peer.slice(PEER_PREFIX.length)
       : conn.peer
-    this.conns.get(friendId)?.close()
+
+    const existing = this.conns.get(friendId)
+    if (existing && existing !== conn) {
+      // Glare: iki taraf aynı anda birbirine bağlanırsa iki taraf da kendi
+      // bağlantısını koruyup karşınınkini kapatabilir ve ikisi de ölü kalır.
+      // Deterministik çözüm: küçük ID'li taraf başlatıcı olarak kazanır.
+      const existingUsable =
+        existing.open || Date.now() - (this.attempts.get(friendId) ?? 0) < RETRY_INTERVAL_MS
+      if (incoming && this.myId < friendId && existingUsable) {
+        conn.close()
+        return
+      }
+      existing.close()
+    }
     this.conns.set(friendId, conn)
 
     conn.on('open', () => {
@@ -123,7 +138,7 @@ class PeerManager {
         useChatStore.getState().setOnline(friendId, true)
         const name = useChatStore.getState().myName
         if (name) conn.send({ type: 'profile', name } satisfies WireMessage)
-        await this.flushPending(friendId, conn)
+        await this.resendUndelivered(friendId, conn)
       })()
     })
 
@@ -167,10 +182,14 @@ class PeerManager {
     }
   }
 
-  /** Bağlantı yokken kuyruklanmış mesajları gönderir. */
-  private async flushPending(friendId: string, conn: DataConnection) {
-    const pending = await pendingOf(friendId)
-    for (const m of pending) {
+  /**
+   * Teslim onayı (ack) almamış tüm mesajları yeniden gönderir: hem bağlantı
+   * yokken kuyruklananlar hem de gönderilip karşıya ulaşmamış olabilenler.
+   * Alıcı aynı id'li mesajı put ile üzerine yazdığından tekrar zararsızdır.
+   */
+  private async resendUndelivered(friendId: string, conn: DataConnection) {
+    const undelivered = await undeliveredOf(friendId)
+    for (const m of undelivered) {
       if (!conn.open) return
       conn.send({ type: 'msg', id: m.id, text: m.text, ts: m.ts } satisfies WireMessage)
       await db.messages.update(m.id, { status: 'sent' })

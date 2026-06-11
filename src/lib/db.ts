@@ -49,10 +49,10 @@ export function messagesOf(convId: string) {
     .toArray()
 }
 
-export function pendingOf(convId: string) {
+export function undeliveredOf(convId: string) {
   return db.messages
     .where('convId')
     .equals(convId)
-    .filter((m) => m.direction === 'out' && m.status === 'pending')
+    .filter((m) => m.direction === 'out' && m.status !== 'delivered')
     .sortBy('ts')
 }
