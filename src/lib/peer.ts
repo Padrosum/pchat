@@ -7,6 +7,8 @@ type WireMessage =
   | { type: 'msg'; id: string; text: string; ts: number }
   | { type: 'ack'; id: string }
   | { type: 'profile'; name: string }
+  | { type: 'ping' }
+  | { type: 'pong' }
 
 const RETRY_INTERVAL_MS = 10_000
 const RECONNECT_DELAY_MS = 2_000
@@ -14,6 +16,11 @@ const RECONNECT_DELAY_MS = 2_000
 const HANDSHAKE_GRACE_MS = RETRY_INTERVAL_MS - 2_000
 const ID_RETRY_DELAY_MS = 3_000
 const MAX_ID_RETRIES = 3
+/**
+ * Karşıdan bu süre boyunca hiç veri/pong gelmediyse kanal yarı açık (zombi)
+ * sayılır: telefon kilitlendiğinde/sekme donduğunda 'close' hiç gelmeyebilir.
+ */
+const STALE_MS = 30_000
 
 class PeerManager {
   private peer: Peer | null = null
@@ -23,6 +30,8 @@ class PeerManager {
   private attempts = new Map<string, number>()
   /** friendId → mevcut bağlantının (yön fark etmez) benimsendiği an. */
   private connAt = new Map<string, number>()
+  /** friendId → karşıdan en son veri (mesaj/ack/pong…) alınan an. */
+  private lastHeard = new Map<string, number>()
   /** Peer henüz açılmadan istenen bağlantılar — 'open' gelince kurulur. */
   private queued = new Set<string>()
   private retryTimer: number | undefined
@@ -125,10 +134,32 @@ class PeerManager {
     }
   }
 
-  /** Açık bağlantısı olmayan tüm kişilere bağlanmayı dener. */
+  /**
+   * Periyodik süpürme: açık bağlantısı olmayan kişilere bağlanmayı dener;
+   * açık bağlantılarda kalp atışı gönderir, zombi kanalı kapatıp yeniden arar
+   * ve ack'siz mesajları yeniden gönderir. Böylece "açık görünen ama ölü"
+   * bir kanala gönderilip kaybolan mesajlar en geç birkaç döngüde teslim olur.
+   */
   private async connectToContacts() {
     const contacts = await db.contacts.toArray()
-    for (const c of contacts) this.connectTo(c.id)
+    for (const c of contacts) {
+      try {
+        const conn = this.conns.get(c.id)
+        if (!conn?.open) {
+          this.connectTo(c.id)
+          continue
+        }
+        if (Date.now() - (this.lastHeard.get(c.id) ?? 0) > STALE_MS) {
+          conn.close() // drop tetiklenir; hemen taze bir arama başlat
+          this.connectTo(c.id)
+          continue
+        }
+        conn.send({ type: 'ping' } satisfies WireMessage)
+        await this.resendUndelivered(c.id, conn)
+      } catch {
+        // Tek kişideki gönderim hatası süpürmenin kalanını durdurmasın.
+      }
+    }
   }
 
   connectTo(friendId: string) {
@@ -165,6 +196,9 @@ class PeerManager {
       const iRecentlyDialed =
         Date.now() - (this.attempts.get(friendId) ?? 0) < RETRY_INTERVAL_MS
       if (incoming && this.myId < friendId && iRecentlyDialed) {
+        // Emniyet: el sıkışma ortasında close bazen tutmaz; yine de açılırsa
+        // dinleyicisiz bir hayalet kanal kalmasın, açılır açılmaz kapat.
+        conn.on('open', () => conn.close())
         conn.close()
         return
       }
@@ -174,6 +208,7 @@ class PeerManager {
     this.connAt.set(friendId, Date.now())
 
     conn.on('open', () => {
+      this.lastHeard.set(friendId, Date.now())
       void (async () => {
         await ensureContact(friendId)
         await db.contacts.update(friendId, { lastSeen: Date.now() })
@@ -192,6 +227,7 @@ class PeerManager {
       if (this.conns.get(friendId) === conn) {
         this.conns.delete(friendId)
         this.connAt.delete(friendId)
+        this.lastHeard.delete(friendId)
         useChatStore.getState().setOnline(friendId, false)
       }
     }
@@ -210,6 +246,7 @@ class PeerManager {
   }
 
   private async handleData(friendId: string, conn: DataConnection, data: WireMessage) {
+    this.lastHeard.set(friendId, Date.now())
     switch (data?.type) {
       case 'msg': {
         await ensureContact(friendId)
@@ -243,6 +280,11 @@ class PeerManager {
       case 'profile':
         await ensureContact(friendId)
         await db.contacts.update(friendId, { name: data.name })
+        break
+      case 'ping':
+        if (conn.open) conn.send({ type: 'pong' } satisfies WireMessage)
+        break
+      case 'pong':
         break
     }
   }
