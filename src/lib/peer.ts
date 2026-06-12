@@ -1,5 +1,5 @@
 import Peer, { type DataConnection } from 'peerjs'
-import { db, ensureContact, undeliveredOf, type Message } from './db'
+import { db, ensureContact, lastMessageOf, markSent, undeliveredOf, type Message } from './db'
 import { PEER_PREFIX } from './id'
 import { useChatStore } from '../store/chat'
 
@@ -10,15 +10,24 @@ type WireMessage =
 
 const RETRY_INTERVAL_MS = 10_000
 const RECONNECT_DELAY_MS = 2_000
+/** Bu süreden taze, henüz açılmamış bir el sıkışma varsa yeni deneme onu bölmesin. */
+const HANDSHAKE_GRACE_MS = RETRY_INTERVAL_MS - 2_000
+const ID_RETRY_DELAY_MS = 3_000
+const MAX_ID_RETRIES = 3
 
 class PeerManager {
   private peer: Peer | null = null
   private myId = ''
   private conns = new Map<string, DataConnection>()
+  /** friendId → benim son arama (outgoing connect) zamanım. */
   private attempts = new Map<string, number>()
+  /** friendId → mevcut bağlantının (yön fark etmez) benimsendiği an. */
+  private connAt = new Map<string, number>()
   /** Peer henüz açılmadan istenen bağlantılar — 'open' gelince kurulur. */
   private queued = new Set<string>()
   private retryTimer: number | undefined
+  private idRetries = 0
+  private listenersBound = false
 
   start(myId: string) {
     if (this.peer) return
@@ -48,6 +57,7 @@ class PeerManager {
     this.peer = peer
 
     peer.on('open', () => {
+      this.idRetries = 0
       useChatStore.getState().setStatus('online')
       const queued = [...this.queued]
       this.queued.clear()
@@ -69,13 +79,26 @@ class PeerManager {
       // Karşı taraf çevrimdışı — bağlantı denemesi başarısız, retry döngüsü tekrar dener.
       if (type === 'peer-unavailable') return
       if (type === 'unavailable-id') {
-        useChatStore.getState().setStatus('error')
+        // Hızlı yenileme/uyanma sonrası PeerJS Cloud eski oturumu birkaç saniye
+        // daha tutabilir — hemen pes etme, kimliği birkaç kez yeniden dene.
+        if (this.idRetries < MAX_ID_RETRIES) {
+          this.idRetries++
+          peer.destroy()
+          this.peer = null
+          this.conns.clear()
+          this.connAt.clear()
+          useChatStore.getState().setStatus('connecting')
+          window.setTimeout(() => this.start(myId), ID_RETRY_DELAY_MS)
+        } else {
+          useChatStore.getState().setStatus('error')
+        }
         return
       }
       // Ağ kopması vb. ölümcül hatalarda Peer yok edilir; baştan başlat.
       if (peer.destroyed) {
         this.peer = null
         this.conns.clear()
+        this.connAt.clear()
         useChatStore.getState().setStatus('connecting')
         window.setTimeout(() => this.start(myId), RECONNECT_DELAY_MS)
       }
@@ -85,6 +108,21 @@ class PeerManager {
       () => void this.connectToContacts(),
       RETRY_INTERVAL_MS,
     )
+
+    // Mobil uyku / ağ kopması dönüşünde retry'ı beklemeden toparlan.
+    if (!this.listenersBound) {
+      this.listenersBound = true
+      const resume = () => {
+        const p = this.peer
+        if (!p || p.destroyed) return
+        if (p.disconnected) p.reconnect()
+        void this.connectToContacts()
+      }
+      window.addEventListener('online', resume)
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') resume()
+      })
+    }
   }
 
   /** Açık bağlantısı olmayan tüm kişilere bağlanmayı dener. */
@@ -102,10 +140,11 @@ class PeerManager {
     }
     const existing = this.conns.get(friendId)
     if (existing?.open) return
-    // Henüz açılmamış taze bir deneme varsa el sıkışmayı bölme; bayatsa temizle.
-    if (existing && Date.now() - (this.attempts.get(friendId) ?? 0) < RETRY_INTERVAL_MS - 2_000) return
+    // Yön fark etmeksizin taze bir el sıkışma sürüyorsa bölme; bayatsa temizle.
+    if (existing && Date.now() - (this.connAt.get(friendId) ?? 0) < HANDSHAKE_GRACE_MS) return
     existing?.close()
     this.conns.delete(friendId)
+    this.connAt.delete(friendId)
     this.attempts.set(friendId, Date.now())
     const conn = this.peer.connect(PEER_PREFIX + friendId, { reliable: true })
     this.setupConnection(conn, false)
@@ -118,18 +157,21 @@ class PeerManager {
 
     const existing = this.conns.get(friendId)
     if (existing && existing !== conn) {
-      // Glare: iki taraf aynı anda birbirine bağlanırsa iki taraf da kendi
-      // bağlantısını koruyup karşınınkini kapatabilir ve ikisi de ölü kalır.
-      // Deterministik çözüm: küçük ID'li taraf başlatıcı olarak kazanır.
-      const existingUsable =
-        existing.open || Date.now() - (this.attempts.get(friendId) ?? 0) < RETRY_INTERVAL_MS
-      if (incoming && this.myId < friendId && existingUsable) {
+      // Glare: iki taraf aynı anda birbirini ararsa deterministik çözüm —
+      // küçük ID'li taraf başlatıcı olarak kazanır, geleni reddeder.
+      // Ama bu kural yalnızca ben *yakın zamanda kendim aradıysam* geçerli:
+      // karşı taraf sayfayı yenileyip yeniden aradığında elimdeki eski "zombi"
+      // bağlantıyı koruyup geleni reddetmek karşıyı kalıcı olarak kilitler.
+      const iRecentlyDialed =
+        Date.now() - (this.attempts.get(friendId) ?? 0) < RETRY_INTERVAL_MS
+      if (incoming && this.myId < friendId && iRecentlyDialed) {
         conn.close()
         return
       }
       existing.close()
     }
     this.conns.set(friendId, conn)
+    this.connAt.set(friendId, Date.now())
 
     conn.on('open', () => {
       void (async () => {
@@ -149,27 +191,50 @@ class PeerManager {
     const drop = () => {
       if (this.conns.get(friendId) === conn) {
         this.conns.delete(friendId)
+        this.connAt.delete(friendId)
         useChatStore.getState().setOnline(friendId, false)
       }
     }
     conn.on('close', drop)
-    conn.on('error', drop)
+    conn.on('error', () => {
+      conn.close()
+      drop()
+    })
+    // Ağ tamamen koptuğunda 'close' gecikebilir; ICE çöküşünü zombi bırakma.
+    conn.on('iceStateChanged', (state) => {
+      if (state === 'failed' || state === 'closed') {
+        conn.close()
+        drop()
+      }
+    })
   }
 
   private async handleData(friendId: string, conn: DataConnection, data: WireMessage) {
     switch (data?.type) {
       case 'msg': {
         await ensureContact(friendId)
-        await db.messages.put({
-          id: data.id,
-          convId: friendId,
-          direction: 'in',
-          text: data.text,
-          ts: data.ts,
-          status: 'delivered',
-        })
+        // Yeniden gönderim tekrarı: kayıt zaten varsa ts'i ezme, sadece ack'le.
+        const exists = await db.messages.get(data.id)
+        if (!exists) {
+          // Gönderici saati ileride olabilir ya da kuyruktaki mesaj geç gelebilir;
+          // sohbet sırası monoton kalsın: yerel saate kırp, son mesajın altına koy.
+          const last = await lastMessageOf(friendId)
+          const ts = Math.max(Math.min(data.ts, Date.now()), last ? last.ts + 1 : 0)
+          await db.messages
+            .add({
+              id: data.id,
+              convId: friendId,
+              direction: 'in',
+              text: data.text,
+              ts,
+              status: 'delivered',
+            })
+            .catch((e) => {
+              if (e?.name !== 'ConstraintError') throw e
+            })
+        }
         await db.contacts.update(friendId, { lastSeen: Date.now() })
-        conn.send({ type: 'ack', id: data.id } satisfies WireMessage)
+        if (conn.open) conn.send({ type: 'ack', id: data.id } satisfies WireMessage)
         break
       }
       case 'ack':
@@ -192,24 +257,26 @@ class PeerManager {
     for (const m of undelivered) {
       if (!conn.open) return
       conn.send({ type: 'msg', id: m.id, text: m.text, ts: m.ts } satisfies WireMessage)
-      await db.messages.update(m.id, { status: 'sent' })
+      await markSent(m.id)
     }
   }
 
   async sendMessage(friendId: string, text: string) {
+    const last = await lastMessageOf(friendId)
     const msg: Message = {
       id: crypto.randomUUID(),
       convId: friendId,
       direction: 'out',
       text,
-      ts: Date.now(),
+      // Monoton ts: aynı milisaniyede üst üste gönderimde sıra bozulmasın.
+      ts: Math.max(Date.now(), last ? last.ts + 1 : 0),
       status: 'pending',
     }
     await db.messages.add(msg)
     const conn = this.conns.get(friendId)
     if (conn?.open) {
       conn.send({ type: 'msg', id: msg.id, text: msg.text, ts: msg.ts } satisfies WireMessage)
-      await db.messages.update(msg.id, { status: 'sent' })
+      await markSent(msg.id)
     } else {
       this.connectTo(friendId)
     }

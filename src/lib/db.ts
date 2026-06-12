@@ -49,6 +49,19 @@ export function messagesOf(convId: string) {
     .toArray()
 }
 
+/**
+ * Mesajı 'sent' işaretler ama yalnızca hâlâ 'pending' ise: gönderim ile ack
+ * yarışırsa ack'in yazdığı 'delivered' geri 'sent'e düşmemeli.
+ */
+export function markSent(id: string) {
+  return db.messages
+    .where('id')
+    .equals(id)
+    .modify((m) => {
+      if (m.status === 'pending') m.status = 'sent'
+    })
+}
+
 export function undeliveredOf(convId: string) {
   return db.messages
     .where('convId')
